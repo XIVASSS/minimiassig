@@ -58,8 +58,14 @@ app.post("/api/chat", async (c) => {
         onMeta: (meta) => {
           void stream.writeSSE({ event: "meta", data: JSON.stringify(meta) });
         },
-        onDelta: (text) => {
-          void stream.writeSSE({ event: "delta", data: JSON.stringify({ text }) });
+        onDelta: (text, options) => {
+          void stream.writeSSE({
+            event: "delta",
+            data: JSON.stringify({ text, replace: Boolean(options?.replace) }),
+          });
+        },
+        onSources: (sources) => {
+          void stream.writeSSE({ event: "sources", data: JSON.stringify({ sources }) });
         },
       });
       await stream.writeSSE({

@@ -7,7 +7,7 @@ import { importHistoryFile } from "../src/memory/history.js";
 import { insertMessage, openDatabase } from "../src/memory/db.js";
 import { recall } from "../src/memory/recall.js";
 import { routeMessage } from "../src/agent/route.js";
-import { parseFeed } from "../src/search/web.js";
+import { cleanMarkup, cleanPlainText, keepRelevant, parseFeed, searchTerms } from "../src/search/web.js";
 import { pagesToOpen } from "../src/search/checks.js";
 
 const TZ = "Asia/Kolkata";
@@ -86,7 +86,8 @@ describe("recall", () => {
   it("searches when the question names something outside the thread", () => {
     assert.equal(routeMessage("what about minimi", false), "research");
     assert.equal(routeMessage("minimi ??", false), "research");
-    assert.equal(routeMessage("productivity", false), "chat");
+    assert.equal(routeMessage("productivity", false), "research");
+    assert.equal(routeMessage("hi", false), "chat");
   });
 
   it("reads a keyless search feed", () => {
@@ -97,5 +98,30 @@ describe("recall", () => {
     assert.equal(hits.length, 1);
     assert.equal(hits[0]?.url, "https://www.projectminimi.com/");
     assert.match(hits[0]?.highlight ?? "", /AI cat/);
+    assert.equal(searchTerms("I am looking for some good sale CRM tools. Can you find"), "sales crm tools");
+    const ranked = keepRelevant(
+      [
+        { title: "AM and PM", url: "https://www.timeanddate.com/calendar/am-pm.html", publishedDate: null, highlight: "AM means before noon." },
+        { title: "Best CRM software", url: "https://www.hubspot.com/products/crm", publishedDate: null, highlight: "A sales CRM keeps your pipeline in one place." },
+      ],
+      "sales crm tools",
+    );
+    assert.equal(ranked.length, 1);
+    assert.match(ranked[0]?.url ?? "", /hubspot/);
+    assert.equal(
+      keepRelevant(
+        [{ title: "Free online games", url: "https://www.agame.com/", publishedDate: null, highlight: "Hello Kitty and a thief named Bob." }],
+        "elon",
+      ).length,
+      0,
+    );
+    assert.equal(
+      cleanPlainText("Narendra [[Gujarati people|Gujarati]] {{sfn|Marino|2014|pp=4–5}} \"}},\"i\":0}}]}'> (born 1950)"),
+      "Narendra Gujarati (born 1950)",
+    );
+    assert.match(
+      cleanMarkup("**Narendra Modi** is PM.\n\nKey facts about them:\n- **Born:** 1950"),
+      /Key facts about them:/,
+    );
   });
 });

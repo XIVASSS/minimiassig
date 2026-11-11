@@ -10,6 +10,7 @@ import { recall } from "../memory/recall.js";
 import { contentTokens } from "../memory/tokens.js";
 import { asksWhatShipped, pagesToOpen } from "../search/checks.js";
 import { readPages, searchWeb, type Freshness, type SearchPayload } from "../search/exa.js";
+import { cleanMarkup, cleanPlainText, isMenuText, keepRelevant, readOpenPage, searchTerms } from "../search/web.js";
 
 export type TurnInput = {
   db: DatabaseSync;
@@ -17,8 +18,16 @@ export type TurnInput = {
   sessionId?: string;
   at?: Date;
   onStatus: (text: string) => void;
-  onDelta: (text: string) => void;
+  onDelta: (text: string, options?: { replace?: boolean }) => void;
   onMeta: (meta: { sessionId: string; assumptions: string[]; note: string; route: RouteKind }) => void;
+  onSources?: (sources: SourceCard[]) => void;
+};
+
+export type SourceCard = {
+  n: number;
+  title: string;
+  url: string;
+  snippet: string;
 };
 
 export type TurnResult = {
@@ -48,15 +57,37 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
   archive.messages = archive.messages.filter((message) => !seen.has(message.id));
 
   const messages: ModelMessage[] = [
-    ...history.map((message) => ({ role: message.role, content: message.content })),
+    ...history.map((message) => ({ role: message.role, content: message.content.replace(/\n*<!--sources:[\s\S]*?-->/g, "") })),
     { role: "user", content: input.message },
   ];
   const checks = route === "verify" ? pagesToOpen(archive.episodes) : [];
   let pages: SearchPayload | undefined;
   if (route === "research") {
-    const query = lookupQuery(input.message);
+    const query = searchTerms(input.message);
     input.onStatus(`Searching: ${query}`);
-    pages = await searchWeb(input.db, { query, freshness: "any", maxResults: 5 });
+    pages = await searchWeb(input.db, { query, freshness: "any", maxResults: 8 });
+    if (pages.results.length) {
+      pages = { ...pages, query, results: keepRelevant(pages.results, query) };
+      input.onStatus("Opening the pages");
+      const opened = await Promise.all(pages.results.slice(0, 3).map((hit) => readOpenPage(hit.url)));
+      const needles = query.toLowerCase().split(/\s+/).filter(Boolean);
+      pages = {
+        ...pages,
+        results: pages.results.map((hit, index) => {
+          if (/wikipedia\.org/i.test(hit.url) && hit.highlight.length > 80) {
+            return { ...hit, highlight: cleanPlainText(hit.highlight) };
+          }
+          const page = opened[index];
+          if (!page?.highlight || page.highlight.length < 80 || isMenuText(page.highlight)) {
+            return { ...hit, highlight: cleanPlainText(hit.highlight) };
+          }
+          const usable = needles.some((needle) => page.highlight.toLowerCase().includes(needle));
+          if (!usable) return { ...hit, highlight: cleanPlainText(hit.highlight) };
+          return { ...hit, title: hit.title || page.title, highlight: cleanPlainText(page.highlight) };
+        }),
+      };
+      input.onSources?.(sourceCards(pages, input.message));
+    }
   } else if (checks.length) {
     input.onStatus(`Opening ${checks.length} pages we cited`);
     pages = await readPages(
@@ -105,6 +136,7 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
     let toolCalls = 0;
     let text = "";
     let held = "";
+    const quiet = route === "research";
     const result = streamText({
       model: requireModel(),
       maxRetries: 0,
@@ -120,14 +152,14 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
     for await (const part of result.fullStream) {
       if (part.type === "tool-call") {
         toolCalls += 1;
-        if (held) {
+        if (held && !quiet) {
           input.onDelta(held);
           held = "";
         }
       }
       if (part.type === "text-delta") {
         text += part.text;
-        if (holdUntilSearch && toolCalls === 0) held += part.text;
+        if (quiet || (holdUntilSearch && toolCalls === 0)) held += part.text;
         else input.onDelta(part.text);
       }
       if (part.type === "error") {
@@ -140,15 +172,24 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
   let answer: string;
   if (route === "research" && pages?.error) {
     answer = `Web search did not run (${pages.error}). I can't look this up until that is fixed.`;
-    input.onDelta(answer);
+    input.onDelta(answer, { replace: true });
   } else {
     try {
       answer = await speak();
     } catch (error) {
       if (!pages?.results.length) throw error;
-      answer = fallbackFromPages(pages);
-      input.onDelta(answer);
+      answer = "";
     }
+  }
+
+  if (route === "research" && pages?.results.length) {
+    if (!answer.trim() || looksDirty(answer) || !isStructured(answer)) {
+      answer = composeStructuredAnswer(pages, input.message);
+    } else {
+      answer = polishAnswer(answer);
+    }
+    input.onDelta(answer, { replace: true });
+    input.onSources?.(sourceCards(pages, input.message));
   }
 
   async function speak(): Promise<string> {
@@ -160,7 +201,7 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
       "You answered without searching. Call web_search before the final answer.",
       true,
     );
-    if (second.toolCalls === 0 && second.text) input.onDelta(second.text);
+    if (second.toolCalls === 0 && second.text && route !== "research") input.onDelta(second.text);
     return second.text;
   }
 
@@ -168,7 +209,7 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
   const assistant = insertMessage(input.db, {
     sessionId,
     role: "assistant",
-    content: answer,
+    content: withSources(answer, pages, input.message),
     at: assistantAt,
   });
   void extractTurn(input.message, answer)
@@ -192,17 +233,129 @@ export async function runTurn(input: TurnInput): Promise<TurnResult> {
   return { sessionId, text: answer };
 }
 
-function fallbackFromPages(pages: SearchPayload): string {
-  const [first, ...rest] = pages.results;
-  if (!first) return "Web search returned no pages.";
-  const lead = [first.title, first.highlight, first.url].filter(Boolean).join(" ");
-  const more = rest.slice(0, 2).map((hit) => `${hit.title} ${hit.url}`);
-  return more.length ? `${lead}\n\nAlso: ${more.join(" ")}` : lead;
+function sourceCards(pages: SearchPayload, question?: string): SourceCard[] {
+  const terms = searchTerms(question || pages.query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  const ordered = [...pages.results]
+    .filter((hit) => !/estranged wife|ministry|disambiguation|may refer to/i.test(`${hit.title} ${hit.highlight}`))
+    .sort((a, b) => {
+      const score = (hit: typeof a) =>
+        terms.reduce((sum, term) => sum + (hit.title.toLowerCase().includes(term) ? 2 : 0) + (hit.highlight.toLowerCase().includes(term) ? 1 : 0), 0);
+      return score(b) - score(a);
+    });
+  const primary = ordered[0]?.title.toLowerCase();
+  const picks = (ordered.length ? ordered : pages.results)
+    .filter((hit, index) => {
+      if (index === 0 || !primary) return true;
+      const title = hit.title.toLowerCase();
+      if (title === primary) return true;
+      const primaryLast = primary.split(/\s+/).at(-1) || "";
+      const hitLast = title.split(/\s+/).at(-1) || "";
+      if (primaryLast && hitLast === primaryLast && title !== primary && !title.includes(primary.split(/\s+/)[0] || "")) return false;
+      return true;
+    })
+    .slice(0, 3);
+  return picks.map((hit, index) => ({
+    n: index + 1,
+    title: hit.title,
+    url: hit.url,
+    snippet: cleanPlainText(hit.highlight).slice(0, 180),
+  }));
 }
 
-function lookupQuery(message: string): string {
-  const query = message.replace(/[?!.]+/g, " ").replace(/\s+/g, " ").trim();
-  return (query || message).slice(0, 200);
+function withSources(text: string, pages?: SearchPayload, question?: string): string {
+  if (!pages?.results.length || text.includes("<!--sources:")) return text;
+  return `${text}\n\n<!--sources:${JSON.stringify(sourceCards(pages, question))}-->`;
+}
+
+function looksDirty(text: string): boolean {
+  return /\[\[|\{\{|","i":|From Wikipedia, the free encyclopedia|may refer to:/i.test(text);
+}
+
+function isStructured(text: string): boolean {
+  return /\*\*[^*]+\*\*/.test(text) && (/^[-•*]\s+\*\*/m.test(text) || /Key facts/i.test(text));
+}
+
+function polishAnswer(text: string): string {
+  const stripped = text
+    .replace(/\n*<!--sources:[\s\S]*?-->/g, "")
+    .replace(/\n*<!--followups:[\s\S]*?-->/g, (match) => match);
+  const followups = text.match(/<!--followups:(\[[\s\S]*?\])-->/);
+  const body = cleanMarkup(stripped.replace(/<!--followups:[\s\S]*?-->/g, ""));
+  if (!body) return text.trim();
+  return followups ? `${body}\n\n<!--followups:${followups[1]}-->` : body;
+}
+
+function rankHits(pages: SearchPayload, question: string) {
+  const terms = searchTerms(question).toLowerCase().split(/\s+/).filter(Boolean);
+  return [...pages.results]
+    .map((hit, index) => {
+      const title = hit.title.toLowerCase();
+      const body = `${title} ${hit.highlight}`.toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (title === term || title.startsWith(term + " ") || title.includes(" " + term)) score += 5;
+        if (title.includes(term)) score += 3;
+        if (body.includes(term)) score += 1;
+      }
+      if (/ministry|disambiguation|may refer to|estranged wife|film|album|song/i.test(title + " " + hit.highlight)) score -= 4;
+      if (/wikipedia\.org/i.test(hit.url)) score += 2;
+      return { hit, index, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+function composeStructuredAnswer(pages: SearchPayload, question: string): string {
+  const ranked = rankHits(pages, question);
+  const best = ranked[0]?.hit ?? pages.results[0];
+  if (!best) return "The pages that came back did not contain a usable answer.";
+  const cite = "[1]";
+  const name = best.title.replace(/\s*\(.*?\)\s*$/, "").trim();
+  const text = cleanPlainText(best.highlight);
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 30 && !isMenuText(part));
+  const clause =
+    text.match(/\b((?:is|has been|has served as|serves as)\s+[^.]+?\.)/i)?.[1] ||
+    sentences[0]?.replace(/^[\w.'-]+(?:\s+[\w.'-]+){0,5}\s+/i, "") ||
+    "is covered in the sources below.";
+  const facts: string[] = [];
+  const born = text.match(/\((?:born|b\.)\s*([^)]+)\)/i) || text.match(/\bborn\s+([^.;]+)/i);
+  if (born) facts.push(`- **Born:** ${born[1].replace(/^[^0-9A-Za-z]+/, "").trim()} ${cite}`);
+  const current =
+    text.match(/\b(?:has served as|serving as|serves as)\s+(?:the\s+)?([^.]+?)(?:\s+since\s+[^.]+)?(?:\.|$)/i) ||
+    text.match(/\bis the\s+([^.]+?(?:prime minister|president|CEO|founder|minister)[^.]*?)(?:\.|$)/i);
+  if (current) {
+    const value = current[0]
+      .replace(/^(?:is|has served as|serving as|serves as)\s+/i, "")
+      .replace(/^(?:the|an|a)\s+/i, "")
+      .trim()
+      .replace(/\s+/g, " ");
+    facts.push(`- **Current Role:** ${value.replace(/\.$/, "")} ${cite}`);
+  } else {
+    const broad = text.match(/\bis (?:an?|the)\s+([^.]+?)(?:\.|$)/i);
+    if (broad) facts.push(`- **Current Role:** ${broad[1].trim().replace(/\s+/g, " ")} ${cite}`);
+  }
+  const previous = text.match(/\bwas (?:the |an? )?([^.]+?(?:chief minister|minister|CEO|founder|president|chairman)[^.]*?)(?:\.|,| and )/i);
+  if (previous) facts.push(`- **Previous Role:** ${previous[1].trim().replace(/\s+/g, " ")} ${cite}`);
+  const known = sentences.find((sentence, index) => {
+    if (index === 0) return false;
+    if (previous && sentence.toLowerCase().includes(previous[1].toLowerCase().slice(0, 24))) return false;
+    return true;
+  });
+  if (known) facts.push(`- **Known for:** ${known.replace(/\s+/g, " ")} ${cite}`);
+  if (!facts.length && sentences[0]) facts.push(`- **Summary:** ${sentences[0].replace(/\s+/g, " ")} ${cite}`);
+  const followups = [`Overview of ${name}'s key work`, `Timeline of ${name}'s career`];
+  const leadLine = `**${name}** ${clause} ${cite}`.replace(/\s+/g, " ").trim();
+  return [
+    leadLine,
+    "",
+    "Key facts about them:",
+    ...facts.slice(0, 5),
+    "",
+    `<!--followups:${JSON.stringify(followups)}-->`,
+  ].join("\n");
 }
 
 function completedTurns(messages: Array<{ role: string; content: string; id: string }>): Array<{ role: "user" | "assistant"; content: string; id: string }> {

@@ -388,7 +388,11 @@
       }
       .msg { display: flex; width: 100%; }
       .msg.user { justify-content: flex-end; }
-      .msg.assistant { justify-content: flex-start; }
+      .msg.assistant {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
       .msg-body {
         max-width: min(42rem, 100%);
         border: 0;
@@ -405,7 +409,127 @@
         padding: 10px 14px;
         border-radius: 16px 16px 4px 16px;
       }
-      .msg.assistant .msg-body { padding: 2px 2px 2px 0; }
+      .msg.assistant .msg-body {
+        padding: 2px 2px 2px 0;
+        width: 100%;
+        white-space: normal;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .msg.assistant .lead {
+        margin: 0;
+        line-height: 1.55;
+        color: var(--text);
+      }
+      .msg.assistant .section-label {
+        margin: 4px 0 0;
+        color: var(--text);
+        font-size: 15px;
+      }
+      .msg.assistant .fact-list {
+        margin: 0;
+        padding: 0 0 0 1.1rem;
+        display: grid;
+        gap: 8px;
+        color: var(--text);
+      }
+      .msg.assistant .fact-list li {
+        line-height: 1.5;
+        padding-left: 2px;
+      }
+      .msg.assistant .fact-list li::marker { color: var(--muted); }
+      .sources {
+        display: flex;
+        gap: 8px;
+        overflow-x: auto;
+        padding: 2px 0 0;
+        width: 100%;
+        max-width: min(42rem, 100%);
+      }
+      .source {
+        flex: 0 0 210px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        text-align: left;
+        border: 1px solid var(--line);
+        background: #2a2926;
+        border-radius: 12px;
+        padding: 10px 12px;
+        color: var(--text);
+        text-decoration: none;
+      }
+      .source small { color: var(--faint); font-size: 11px; text-decoration: underline; }
+      .source b { font-size: 13px; font-weight: 560; line-height: 1.3; }
+      .source span {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .cite {
+        display: inline;
+        margin-left: 4px;
+        color: var(--faint);
+        font-size: 12px;
+        line-height: 1;
+        text-decoration: none;
+        vertical-align: baseline;
+      }
+      .followups {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        width: 100%;
+        max-width: min(42rem, 100%);
+        margin-top: 4px;
+      }
+      .followups-label {
+        width: 100%;
+        max-width: min(42rem, 100%);
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .followup {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 72px;
+        text-align: left;
+        border: 1px solid var(--line);
+        background: #2a2926;
+        border-radius: 14px;
+        padding: 14px;
+        color: var(--text);
+        font: inherit;
+        font-size: 14px;
+        line-height: 1.35;
+        cursor: pointer;
+      }
+      .followup:hover { border-color: #4a4843; }
+      .followup span { flex: 1; }
+      .followup i {
+        flex: 0 0 auto;
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--muted);
+        font-style: normal;
+        font-size: 12px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      @media (max-width: 720px) {
+        .followups { grid-template-columns: 1fr; }
+      }
       .starters[hidden], .stage[hidden] { display: none !important; }
       .app.sidechat:not(.chatting) .chat.has-thread .starters { display: none; }
       .app.sidechat:not(.chatting) .chat.has-thread .thread { flex: 1; }
@@ -987,26 +1111,174 @@
       if (location.hash === "#chat") showChat();
       if (location.hash === "#side") setSideChat(true);
 
-      function linkify(text) {
-        const frag = document.createDocumentFragment();
-        const pattern = /https?:\/\/[^\s)]+/g;
-        let last = 0;
-        for (const match of text.matchAll(pattern)) {
-          frag.append(text.slice(last, match.index));
-          const a = document.createElement("a");
-          a.href = match[0];
-          a.target = "_blank";
-          a.rel = "noreferrer";
-          a.textContent = match[0];
-          frag.append(a);
-          last = match.index + match[0].length;
+      function splitAnswer(text) {
+        let body = String(text || "");
+        let sources = [];
+        let followups = [];
+        const sourceMatch = body.match(/\n*<!--sources:([\s\S]*?)-->\s*$/);
+        if (sourceMatch) {
+          try { sources = JSON.parse(sourceMatch[1]); } catch {}
+          body = body.slice(0, sourceMatch.index).trim();
         }
-        frag.append(text.slice(last));
-        return frag;
+        const followMatch = body.match(/\n*<!--followups:(\[[\s\S]*?\])-->\s*$/);
+        if (followMatch) {
+          try { followups = JSON.parse(followMatch[1]); } catch {}
+          body = body.slice(0, followMatch.index).trim();
+        }
+        return { body, sources, followups };
       }
 
-      function paint(node, text) {
-        node.replaceChildren(linkify(text));
+      function domainOf(url) {
+        try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
+      }
+
+      function citeLabel(source) {
+        const host = domainOf(source.url || "");
+        if (/wikipedia/.test(host)) return "Wikipedia";
+        if (/britannica/.test(host)) return "Britannica";
+        return (source.title || host).split(/[|·-]/)[0].trim().slice(0, 28) || host;
+      }
+
+      function appendInline(parent, text, sources) {
+        const pattern = /\[(\d+)\]|\*\*([^*]+)\*\*|https?:\/\/[^\s)]+/g;
+        let last = 0;
+        for (const match of text.matchAll(pattern)) {
+          if (match.index > last) parent.append(text.slice(last, match.index));
+          if (match[1]) {
+            const source = (sources || []).find((item) => item.n === Number(match[1]));
+            if (source) {
+              const cite = document.createElement("a");
+              cite.className = "cite";
+              cite.href = source.url;
+              cite.target = "_blank";
+              cite.rel = "noreferrer";
+              cite.textContent = citeLabel(source);
+              parent.append(cite);
+            }
+          } else if (match[2]) {
+            const strong = document.createElement("strong");
+            strong.textContent = match[2];
+            parent.append(strong);
+          } else {
+            const a = document.createElement("a");
+            a.href = match[0];
+            a.target = "_blank";
+            a.rel = "noreferrer";
+            a.textContent = match[0];
+            parent.append(a);
+          }
+          last = match.index + match[0].length;
+        }
+        if (last < text.length) parent.append(text.slice(last));
+      }
+
+      function cleanDisplay(text) {
+        return String(text || "")
+          .replace(/\{\{[^{}]*\}\}/g, " ")
+          .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
+          .replace(/\[\[([^\]]+)\]\]/g, "$1")
+          .replace(/[{}|<>]+/g, " ")
+          .replace(/[,"']{2,}/g, " ")
+          .split("\n")
+          .map((line) => line.replace(/[ \t]+/g, " ").trimEnd())
+          .join("\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+      }
+
+      function paint(node, text, sources) {
+        const cleaned = cleanDisplay(text);
+        const lines = cleaned.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        node.replaceChildren();
+        if (!lines.length) return;
+        const structured = lines.some((line) => /^[-•*]\s+/.test(line)) || lines.some((line) => /Key facts/i.test(line));
+        if (!structured || node.closest(".msg.user")) {
+          node.style.whiteSpace = node.closest(".msg.user") ? "pre-wrap" : "pre-wrap";
+          appendInline(node, cleaned, sources);
+          return;
+        }
+        node.style.whiteSpace = "normal";
+        let list = null;
+        for (const line of lines) {
+          if (/^Key facts/i.test(line)) {
+            list = null;
+            const label = document.createElement("p");
+            label.className = "section-label";
+            label.textContent = line.replace(/:$/, "") + ":";
+            node.append(label);
+            continue;
+          }
+          const bullet = line.match(/^[-•*]\s+(.*)$/);
+          if (bullet) {
+            if (!list) {
+              list = document.createElement("ul");
+              list.className = "fact-list";
+              node.append(list);
+            }
+            const item = document.createElement("li");
+            appendInline(item, bullet[1], sources);
+            list.append(item);
+            continue;
+          }
+          list = null;
+          const lead = document.createElement("p");
+          lead.className = "lead";
+          appendInline(lead, line, sources);
+          node.append(lead);
+        }
+      }
+
+      function mountSources(block, sources) {
+        let row = block.querySelector(":scope > .sources");
+        if (!sources?.length) {
+          row?.remove();
+          return;
+        }
+        if (!row) {
+          row = document.createElement("div");
+          row.className = "sources";
+          block.append(row);
+        }
+        row.replaceChildren();
+        for (const source of sources) {
+          const card = document.createElement("a");
+          card.className = "source";
+          card.href = source.url;
+          card.target = "_blank";
+          card.rel = "noreferrer";
+          const site = document.createElement("small");
+          site.textContent = domainOf(source.url);
+          const title = document.createElement("b");
+          title.textContent = source.title || domainOf(source.url);
+          const snippet = document.createElement("span");
+          snippet.textContent = source.snippet || "";
+          card.append(site, title, snippet);
+          row.append(card);
+        }
+      }
+
+      function mountFollowups(block, followups) {
+        block.querySelector(":scope > .followups-label")?.remove();
+        block.querySelector(":scope > .followups")?.remove();
+        if (!followups?.length) return;
+        const label = document.createElement("p");
+        label.className = "followups-label";
+        label.textContent = "Where would you like to go from here?";
+        const row = document.createElement("div");
+        row.className = "followups";
+        for (const item of followups.slice(0, 2)) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "followup";
+          const text = document.createElement("span");
+          text.textContent = item;
+          const arrow = document.createElement("i");
+          arrow.textContent = "↵";
+          button.append(text, arrow);
+          button.addEventListener("click", () => ask(item));
+          row.append(button);
+        }
+        block.append(label, row);
       }
 
       function renderTurn(role, text) {
@@ -1021,9 +1293,10 @@
         name.className = "who";
         name.textContent = role === "user" ? "You" : "Minimi";
         who.append(name);
+        const parsed = splitAnswer(text);
         const summary = document.createElement("p");
         summary.className = "activity-body";
-        paint(summary, text);
+        paint(summary, parsed.body, parsed.sources);
         row.append(who, summary);
         log.append(row);
 
@@ -1031,11 +1304,15 @@
         block.className = "msg " + role;
         const body = document.createElement("div");
         body.className = "msg-body";
-        paint(body, text);
+        paint(body, parsed.body, parsed.sources);
         block.append(body);
+        if (role === "assistant") {
+          mountSources(block, parsed.sources);
+          mountFollowups(block, parsed.followups);
+        }
         thread.append(block);
         thread.scrollTop = thread.scrollHeight;
-        return { body, summary };
+        return { body, summary, block };
       }
 
       function addBubble(role, text) {
@@ -1132,6 +1409,8 @@
           const decoder = new TextDecoder();
           let buf = "";
           let answer = "";
+          let liveSources = [];
+          let liveFollowups = [];
           while (true) {
             const chunk = await reader.read();
             if (chunk.done) break;
@@ -1160,10 +1439,21 @@
                   thread.insertBefore(chip, thread.lastElementChild);
                 }
               }
+              if (event === "sources") {
+                liveSources = payload.sources || [];
+                mountSources(reply.block || reply.body.parentElement, liveSources);
+              }
               if (event === "delta") {
-                answer += payload.text;
-                paint(reply.body, answer);
-                paint(reply.summary, answer);
+                const parsedDelta = splitAnswer(payload.text || "");
+                if (payload.replace) answer = parsedDelta.body;
+                else answer += payload.text || "";
+                if (parsedDelta.followups.length) liveFollowups = parsedDelta.followups;
+                if (parsedDelta.sources.length) liveSources = parsedDelta.sources;
+                const visible = payload.replace ? parsedDelta.body : answer;
+                paint(reply.body, visible, liveSources);
+                paint(reply.summary, visible, liveSources);
+                mountSources(reply.block || reply.body.parentElement, liveSources);
+                mountFollowups(reply.block || reply.body.parentElement, liveFollowups);
                 thread.scrollTop = thread.scrollHeight;
               }
               if (event === "error") throw new Error(payload.text);
@@ -1175,7 +1465,10 @@
             paint(reply.summary, answer);
           }
           if (turns.length) {
-            turns[turns.length - 1].content = reply.body.textContent;
+            const markers = [];
+            if (liveFollowups.length) markers.push("<!--followups:" + JSON.stringify(liveFollowups) + "-->");
+            if (liveSources.length) markers.push("<!--sources:" + JSON.stringify(liveSources) + "-->");
+            turns[turns.length - 1].content = answer + (markers.length ? "\n\n" + markers.join("\n") : "");
             cacheTurns();
           }
         } catch (error) {
